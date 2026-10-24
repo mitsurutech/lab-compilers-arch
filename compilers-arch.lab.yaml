@@ -1,0 +1,190 @@
+# Compilers and computer architecture
+# One Ubuntu VM with a C compiler and the tools around it (make, binutils, gdb, flex, bison),
+# and a RISC-V cross compiler with qemu-user, so a RISC-V program runs here too.
+cpus: 1
+memory: 1024    # MB
+disk: 10        # GB
+
+# Nothing opens in the browser: the lab is the terminal.
+open: []
+
+# Run once, as root. Its output is kept in /var/log/mitsurutech-setup.log on the VM.
+setup: |
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq gcc libc6-dev make binutils gdb flex bison python3 file gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
+  home=/home/student
+  [ -d $home ] || home=/root
+  as_student() { runuser -u student -- "$@"; }
+  as_student mkdir -p $home/compiler $home/arch
+
+  # A tiny C program with a macro and a function, for gcc -E, -S, -c and linking.
+  cat > $home/compiler/hello.c <<'COMPILERS_HELLO_END'
+  #include <stdio.h>
+
+  #define GREETING "Hello from the compilers lab"
+
+  /* A small function, so the assembly has a call to look at. */
+  int square(int n) {
+      return n * n;
+  }
+
+  int main(void) {
+      printf("%s: 7 squared is %d\n", GREETING, square(7));
+      return 0;
+  }
+  COMPILERS_HELLO_END
+
+  # A program with one variable never used and one used where it is not declared.
+  cat > $home/compiler/scope.c <<'COMPILERS_SCOPE_END'
+  #include <stdio.h>
+
+  int main(void) {
+      int unused = 42;
+      int total = 0;
+      for (int i = 1; i <= 3; i++) {
+          int step = i * 10;
+          total = total + step;
+      }
+      printf("total is %d, last step was %d\n", total, step);
+      return 0;
+  }
+  COMPILERS_SCOPE_END
+
+  # A calculator: a flex lexer and a bison parser, built by one make.
+  cat > $home/compiler/calc.l <<'COMPILERS_LEX_END'
+  %{
+  /* The lexer: turns the characters typed into tokens for the parser. */
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include "calc.tab.h"
+  %}
+  %option noyywrap
+  %%
+  [0-9]+     { yylval = atoi(yytext); return NUMBER; }
+  [-+*/()]   { return yytext[0]; }
+  \n         { return '\n'; }
+  [ \t]      { /* spaces are skipped */ }
+  .          { fprintf(stderr, "unexpected character %s\n", yytext); }
+  %%
+  COMPILERS_LEX_END
+  cat > $home/compiler/calc.y <<'COMPILERS_YACC_END'
+  %{
+  /* The parser: a grammar for sums with + - * / and brackets. */
+  #include <stdio.h>
+  int yylex(void);
+  void yyerror(const char *message) { fprintf(stderr, "error: %s\n", message); }
+  %}
+  %token NUMBER
+  %left '+' '-'
+  %left '*' '/'
+  %%
+  lines : %empty
+        | lines line
+        ;
+  line  : '\n'
+        | expr '\n'          { printf("%d\n", $1); }
+        | error '\n'         { yyerrok; }
+        ;
+  expr  : NUMBER
+        | expr '+' expr      { $$ = $1 + $3; }
+        | expr '-' expr      { $$ = $1 - $3; }
+        | expr '*' expr      { $$ = $1 * $3; }
+        | expr '/' expr      { if ($3 == 0) { yyerror("division by zero"); $$ = 0; } else $$ = $1 / $3; }
+        | '(' expr ')'       { $$ = $2; }
+        ;
+  %%
+  int main(void) { return yyparse(); }
+  COMPILERS_YACC_END
+  # A recipe line starts with a tab, written here as "> " and turned into one.
+  cat > $home/compiler/Makefile <<'COMPILERS_MAKE_END'
+  # make builds calc: bison writes the parser, flex the lexer, gcc joins them.
+  calc: calc.tab.c lex.yy.c
+  > gcc -o calc calc.tab.c lex.yy.c
+
+  calc.tab.c calc.tab.h &: calc.y
+  > bison -d calc.y
+
+  lex.yy.c: calc.l calc.tab.h
+  > flex calc.l
+
+  clean:
+  > rm -f calc calc.tab.c calc.tab.h lex.yy.c
+  COMPILERS_MAKE_END
+  sed -i 's/^> /\t/' $home/compiler/Makefile
+
+  # RISC-V assembly: add two numbers and exit with the answer as the status.
+  cat > $home/arch/add.s <<'ARCH_ADD_END'
+  # Adds two numbers and exits with the answer as the exit status.
+          .globl _start
+          .text
+  _start:
+          li      a0, 2           # a0 holds the first number
+          li      a1, 3           # a1 holds the second number
+          add     a0, a0, a1      # a0 = a0 + a1
+          li      a7, 93          # 93 is the Linux system call exit
+          ecall                   # ask Linux to exit, with a0 as the status
+  ARCH_ADD_END
+
+  # Summing a big table row by row, then column by column, timing each.
+  cat > $home/arch/loop.c <<'ARCH_LOOP_END'
+  #include <stdio.h>
+  #include <time.h>
+
+  #define N 4096
+  static int grid[N][N];
+
+  static double since(clock_t start) {
+      return (double)(clock() - start) / CLOCKS_PER_SEC;
+  }
+
+  int main(void) {
+      long sum = 0;
+      for (int r = 0; r < N; r++)
+          for (int c = 0; c < N; c++)
+              grid[r][c] = 1;
+
+      /* Row by row: the next number is the next one along in memory. */
+      clock_t start = clock();
+      for (int r = 0; r < N; r++)
+          for (int c = 0; c < N; c++)
+              sum = sum + grid[r][c];
+      printf("row by row:       %.3f seconds, sum %ld\n", since(start), sum);
+
+      /* Column by column: the next number is a whole row further on. */
+      sum = 0;
+      start = clock();
+      for (int c = 0; c < N; c++)
+          for (int r = 0; r < N; r++)
+              sum = sum + grid[r][c];
+      printf("column by column: %.3f seconds, sum %ld\n", since(start), sum);
+      return 0;
+  }
+  ARCH_LOOP_END
+
+  cat > $home/README.md <<'COMPILERS_README_END'
+  # Lab: compilers and computer architecture
+
+  This machine has a real C compiler and the tools around it, and a RISC-V toolchain with an
+  emulator, so a RISC-V program runs here although this processor is not RISC-V.
+  Nothing here is marked, and nothing you do can hurt anything but this one machine.
+
+  What is here:
+
+  - compiler/hello.c is a small C program with a macro and a function. Try gcc -E, -S and -c.
+  - compiler/scope.c has a variable it never uses and one used where it does not exist.
+    Compile it with gcc -Wall -c scope.c and read what gcc says.
+  - compiler/calc.l and compiler/calc.y are a lexer for flex and a parser for bison.
+    Type make in the compiler folder, then: echo "2 + 3 * 4" | ./calc
+  - arch/add.s adds two numbers in RISC-V assembly. Build it with riscv64-linux-gnu-as and
+    riscv64-linux-gnu-ld, run it with qemu-riscv64 ./add, then echo $? prints the answer.
+  - arch/loop.c sums a big table two ways and times each, to show what a cache does.
+    Build it with gcc -O2 -o loop loop.c, then run ./loop.
+
+  Also installed: gdb to step through a program, objdump to read machine code, python3, and
+  riscv64-linux-gnu-gcc, which compiles C for RISC-V: add -static and run it with qemu-riscv64.
+
+  If you break something badly, stop the lab and start it again from the lesson's bar.
+  COMPILERS_README_END
+  chown -R student:student $home/compiler $home/arch $home/README.md
+  echo "Read README.md in your home folder first." > /etc/motd
